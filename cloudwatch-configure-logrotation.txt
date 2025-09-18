@@ -36,31 +36,11 @@ vi /opt/aws/amazon-cloudwatch-agent/bin/config.json
 
 
 ############### Create logrotate Config #################
+cd /var/log
 
 
-sudo yum install -y logrotate
-
-
-sudo vi /etc/logrotate.d/myapp
-
-
-
-/var/log/myapp/test_error.log {
-    daily
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
- 
-
-  # Dry run for testing
-
-sudo logrotate -f /etc/logrotate.d/myapp  #Force rotate now
-
-
+#install python 
+yum install python3-pip
 
 #run below code python3 app.py
 
@@ -89,6 +69,30 @@ def main():
 
 if __name__ == "__main__":
     main()
+=====
+
+sudo yum install -y logrotate
+
+
+sudo vi /etc/logrotate.d/myapp
+
+
+
+/var/log/myapp/test_error.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+ 
+
+  # Dry run for testing
+
+sudo logrotate -f /etc/logrotate.d/myapp  #Force rotate now
+
 
 
 #if you run above code logs will be stored  in this path /var/log/myapp/test_error.log so here myapp added into log rotation logs will be deleted as per rotation
@@ -118,4 +122,5 @@ CloudWatch	$50	$50	$100
 S3 (Standard)	$2.30	~$0.05	~$2.35
 
 ⚠️ CloudWatch is ~40–50x more expensive than S3 for long-term storage.
+
 
