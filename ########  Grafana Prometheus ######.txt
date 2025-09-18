@@ -1,0 +1,94 @@
+########  Grafana Prometheus #########
+###  Install Prometheus
+
+wget https://github.com/prometheus/prometheus/releases/download/v2.52.0/prometheus-2.52.0.linux-amd64.tar.gz
+tar -xvf prometheus-2.52.0.linux-amd64.tar.gz
+cd prometheus-2.52.0.linux-amd64
+sudo cp prometheus promtool /usr/local/bin/
+sudo mkdir -p /etc/prometheus /var/lib/prometheus
+sudo cp -r consoles console_libraries prometheus.yml /etc/Prometheus
+
+
+#Edit Prometheus Config
+sudo vi /etc/prometheus/prometheus.yml
+
+scrape_configs:
+  - job_name: 'ec2-servers'
+    static_configs:
+      - targets: ['10.0.1.10:9100', '10.0.1.11:9100']  # Replace with your EC2 private IPs
+
+
+#Start Prometheus
+
+cat <<EOF | sudo tee /etc/systemd/system/prometheus.service
+[Unit]
+Description=Prometheus
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reexec
+sudo systemctl enable --now Prometheus
+
+
+#Install Grafana on Same Instance
+
+sudo yum install -y https://dl.grafana.com/oss/release/grafana-10.4.2-1.x86_64.rpm
+sudo systemctl enable --now grafana-server
+
+Access Grafana
+http://<monitor-ec2-public-ip>:3000
+Default login: admin / admin
+
+
+
+-------------------------------
+#On Each Target EC2 node (to be monitored)
+
+wget https://github.com/prometheus/node_exporter/releases/download/v1.8.1/node_exporter-1.8.1.linux-amd64.tar.gz
+tar -xvf node_exporter-1.8.1.linux-amd64.tar.gz
+cd node_exporter-1.8.1.linux-amd64
+sudo cp node_exporter /usr/local/bin/
+
+
+
+#Create and start the service:
+
+cat <<EOF | sudo tee /etc/systemd/system/node_exporter.service
+[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+User=nobody
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reexec
+sudo systemctl enable --now node_exporter
+
+
+ --- finally ---
+Add Grafana Dashboard
+In Grafana:
+
+Add Prometheus data source → http://localhost:9090
+
+Import dashboard ID 1860 from Grafana.com (Node Exporter Full)
+
+All EC2s will appear by instance IP
+
+
+
+
