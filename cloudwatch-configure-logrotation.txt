@@ -1,0 +1,121 @@
+
+############### to install cloud watch agent ####################
+
+yum install amazon-cloudwatch-agent -y   
+
+
+vi /opt/aws/amazon-cloudwatch-agent/bin/config.json
+
+
+#copy and past below json file 
+
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/",
+                      "log_group_name": "LOG-FROM-EC2",
+                      "log_stream_name": " {instance_id}",
+                      "retention_in_days": 1  #retention period means log will be deleted from cloudwatch
+                    }
+                  ]
+                }
+              }
+            }
+          }
+
+
+# start agent with config file 
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
+
+
+
+
+
+############### Create logrotate Config #################
+
+
+sudo yum install -y logrotate
+
+
+sudo vi /etc/logrotate.d/myapp
+
+
+
+/var/log/myapp/test_error.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+ 
+
+  # Dry run for testing
+
+sudo logrotate -f /etc/logrotate.d/myapp  #Force rotate now
+
+
+
+#run below code python3 app.py
+
+import logging
+
+# Log file path
+log_file = "/var/log/myapp/test_error.log"
+
+# Setup logging
+logging.basicConfig(
+    filename=log_file,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+def main():
+    logging.info("✅ Starting log test")
+
+    try:
+        logging.info("🔍 Trying to divide by zero")
+        result = 10 / 0  # This will raise ZeroDivisionError
+    except Exception as e:
+        logging.error("❌ Error occurred: %s", e, exc_info=True)
+
+    logging.info("🏁 Log test completed")
+
+if __name__ == "__main__":
+    main()
+
+
+#if you run above code logs will be stored  in this path /var/log/myapp/test_error.log so here myapp added into log rotation logs will be deleted as per rotation
+
+
+
+
+| Feature                          | **EC2 Local Logs**                 | **CloudWatch Logs**                             | **S3 Log Storage**                                    |
+| -------------------------------- | ---------------------------------- | ----------------------------------------------- | ----------------------------------------------------- |
+| **Where logs are stored**        | On the EC2 instance's disk         | AWS CloudWatch Logs service                     | AWS S3 bucket                                         |
+| **Persistence**                  | Temporary (lost if EC2 is deleted) | Persistent (independent of EC2)                 | Persistent (good for long-term storage)               |
+| **Access method**                | SSH into EC2                       | CloudWatch Console, CLI, SDK                    | S3 Console, CLI, SDK                                  |
+| **Log rotation needed?**         | Yes (manually with logrotate)      | No (CloudWatch manages it)                      | Optional (use S3 lifecycle policies)                  |
+| **Retention setting**            | No (manual delete)                 | Yes (30 days, 1 year, etc.)                     | Yes (S3 lifecycle rules: delete/archive after X days) |
+| **Monitoring & Alarms**          | No built-in                        | Yes (CloudWatch Alarms, Insights)               | No (must use Athena or Lambda to process)             |
+| **Real-time log stream**         | No                                 | Yes                                             | No (batch uploads only)                               |
+| **Cost**                         | Free (uses EC2 disk space)         | Paid (based on ingestion, retention, retrieval) | Paid (based on storage size and duration)             |
+| **Best for**                     | Debugging on instance              | Centralized live monitoring, metrics, alerting  | Archival, compliance, long-term log storage           |
+| **Risk on instance termination** | High (logs lost)                   | Low (logs retained in CloudWatch)               | None (stored in S3 regardless of EC2 lifecycle)       |
+
+
+
+Let's assume 100 GB logs/month:
+
+Service	Storage Cost	Ingestion Cost	Total (approx)
+CloudWatch	$50	$50	$100
+S3 (Standard)	$2.30	~$0.05	~$2.35
+
+⚠️ CloudWatch is ~40–50x more expensive than S3 for long-term storage.
+
