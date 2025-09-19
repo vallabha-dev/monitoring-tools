@@ -87,6 +87,7 @@ systemctl strat httpd
 Next go to splunk click on  data summery select sources   
 ◼ Click on httpd/accesslog        ### these are the httpd application access logs
 ==================Testing method 2======
+Move to root directory
 ◼ Create a test.py file add the bellow script 
 import logging 
 # Configure logging settings 
@@ -101,6 +102,8 @@ logging.StreamHandler()
 # Example usage 
 logging.info("This is a success log message.") 
 logging.error("This is an error log message.")
+◼Run python 
+python3 test.py
 
 ◼ Create another file app.py enter the below script 
 import logging 
@@ -125,4 +128,5 @@ logging.info("This message will still log after the error.")
 ◼ Then open splunk data summary select sources  
 ◼ Click on python_app.log 
 You can see the python application logs 
+
 
