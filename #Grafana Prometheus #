@@ -1,5 +1,5 @@
-########  Grafana Prometheus #########
-###  Install Prometheus
+## Grafana Prometheus ##
+#  Install Prometheus
 
 wget https://github.com/prometheus/prometheus/releases/download/v2.52.0/prometheus-2.52.0.linux-amd64.tar.gz
 tar -xvf prometheus-2.52.0.linux-amd64.tar.gz
@@ -88,6 +88,7 @@ Add Prometheus data source → http://localhost:9090
 Import dashboard ID 1860 from Grafana.com (Node Exporter Full)
 
 All EC2s will appear by instance IP
+
 
 
 
