@@ -1,0 +1,372 @@
+mini-project that gives you a working static site on **S3 + CloudFront** and an **auto-invalidation Lambda** that runs whenever you upload/overwrite files in the S3 bucket.
+
+
+
+# 1) Architecture (one-liner)
+
+S3 (private bucket) → CloudFront (Origin Access Control/OAC) delivers the site → S3 `ObjectCreated` event → Lambda (Python) → calls CloudFront `CreateInvalidation` for the changed path.
+
+ASCII:
+
+```
+[User Browser] <--cached by CloudFront--> [CloudFront] <--signed requests (OAC)--> [S3 private bucket]
+                                          ^
+                                          |  (invalidations created by)
+                                          v
+                                     [Lambda]  <-- S3 event notifications (PUT/POST)
+```
+
+---
+
+# 2) Prerequisites
+
+* AWS CLI configured (`aws configure`) with an account that can create S3, Lambda, IAM, CloudFront resources.
+* `jq`, `zip` (optional) installed for scripting.
+* Replace placeholder names in the steps: `YOUR_BUCKET`, `YOUR_REGION`, `YOUR_ACCOUNT_ID`, `YOUR_FUNCTION_NAME`, `YOUR_DISTRIBUTION_ID`.
+* (Tip) Do the CloudFront distribution creation in the console for clarity (step below). You must create any ACM cert for a custom domain in **us-east-1** if you plan to use a CNAME. ([AWS Documentation][2])
+
+---
+
+# 3) Files you’ll create (copy these)
+
+## a) `lambda/lambda_function.py` (Lambda handler — Python 3.11)
+
+```python
+import os
+import boto3
+import logging
+from urllib.parse import unquote_plus
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+cloudfront = boto3.client('cloudfront')
+
+def lambda_handler(event, context):
+    distro_id = os.environ.get('CLOUDFRONT_DISTRIBUTION_ID')
+    if not distro_id:
+        logger.error("CLOUDFRONT_DISTRIBUTION_ID not set")
+        return {"error": "missing env CLOUDFRONT_DISTRIBUTION_ID"}
+
+    paths = set()
+    for record in event.get('Records', []):
+        s3 = record.get('s3', {})
+        obj = s3.get('object', {})
+        key = unquote_plus(obj.get('key', ''))
+        if not key:
+            continue
+        # build CloudFront invalidation paths
+        paths.add('/' + key)
+        # If index.html updated, also invalidate root and its folder
+        if key.endswith('index.html'):
+            paths.add('/')  # root
+            if '/' in key:
+                folder = '/' + key.rsplit('/', 1)[0] + '/'
+                paths.add(folder)
+
+    if not paths:
+        logger.info("No paths found in event")
+        return {"status": "no_paths"}
+
+    caller_ref = context.aws_request_id
+    items = list(paths)
+    logger.info("Creating invalidation for %s", items)
+
+    resp = cloudfront.create_invalidation(
+        DistributionId=distro_id,
+        InvalidationBatch={
+            'Paths': {
+                'Quantity': len(items),
+                'Items': items
+            },
+            'CallerReference': caller_ref
+        }
+    )
+
+    inv_id = resp.get('Invalidation', {}).get('Id')
+    logger.info("Invalidation created: %s", inv_id)
+    return {"invalidation_id": inv_id, "paths": items}
+```
+
+## b) Trust policy for Lambda role: `trust-policy.json`
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "lambda.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+## c) Inline IAM policy for CloudFront invalidation (restrict to distribution) — `cf-inv-policy.json`
+
+> Replace `YOUR_ACCOUNT_ID` and `YOUR_DISTRIBUTION_ID` later (you’ll create distribution then update/replace these).
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontInvalidation",
+      "Effect": "Allow",
+      "Action": "cloudfront:CreateInvalidation",
+      "Resource": "arn:aws:cloudfront::YOUR_ACCOUNT_ID:distribution/YOUR_DISTRIBUTION_ID"
+    }
+  ]
+}
+```
+
+*(If you want a quick permissive test, you can temporarily use `"Resource": "*"` — but best practice is to lock to the distribution ARN.)*
+
+## d) S3 notification config (used with `put-bucket-notification-configuration`) — `notification.json`
+
+> Replace Function ARN before applying.
+
+```json
+{
+  "LambdaFunctionConfigurations": [
+    {
+      "LambdaFunctionArn": "arn:aws:lambda:YOUR_REGION:YOUR_ACCOUNT_ID:function:YOUR_FUNCTION_NAME",
+      "Events": ["s3:ObjectCreated:*"]
+    }
+  ]
+}
+```
+
+## e) Simple static page: `site/index.html`
+
+```html
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Test S3+CF auto-invalidate</title></head>
+<body>
+  <h1>Hello from S3 + CloudFront + Lambda auto-invalidation</h1>
+  <p>Deployed at: <!-- will be overwritten on update --></p>
+</body>
+</html>
+```
+
+---
+
+# 4) Step-by-step commands (ordered) — replace placeholders
+
+### A. Create S3 bucket and upload initial site
+
+```bash
+export REGION=ap-south-1           # your region
+export BUCKET=my-static-site-$(date +%s)   # ensure unique
+aws s3api create-bucket --bucket $BUCKET --region $REGION --create-bucket-configuration LocationConstraint=$REGION
+
+# Upload sample
+aws s3 cp site/index.html s3://$BUCKET/index.html --acl private
+```
+
+> Keep the bucket **private** (do not enable public website hosting). CloudFront will read via OAC. (Docs: CloudFront + S3 origin with OAC). ([AWS Documentation][1])
+
+---
+
+### B. Create Lambda IAM role and attach basic execution role
+
+```bash
+export ROLE_NAME=LambdaCFInvalidatorRole
+aws iam create-role --role-name $ROLE_NAME --assume-role-policy-document file://trust-policy.json
+
+# Attach basic Lambda logging permissions (CloudWatch)
+aws iam attach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+```
+
+---
+
+### C. (Optional now or later) Create CloudFront Origin Access Control (OAC)
+
+You can do this in the CloudFront console when creating the distribution. If you prefer CLI:
+
+1. Create an `oac.json` with:
+
+```json
+{
+  "OriginAccessControlConfig": {
+    "Name": "my-oac",
+    "Description": "OAC for S3 origin",
+    "SigningProtocol": "sigv4",
+    "SigningBehavior": "always",
+    "OriginAccessControlOriginType": "s3"
+  }
+}
+```
+
+2. Run:
+
+```bash
+aws cloudfront create-origin-access-control --origin-access-control-config file://oac.json
+```
+
+Note the returned `Id` (OAC id). (Docs: create-origin-access-control). ([AWS CLI Command Reference][3])
+
+---
+
+### D. Create CloudFront distribution (recommended: Console — easiest)
+
+1. Go to CloudFront console → Create distribution → Web (standard distribution).
+2. Origin domain: choose your S3 bucket (select the bucket REST endpoint, *not* the website endpoint).
+3. In *Origin access* settings pick the OAC you created (or choose the console to create OAC as part of the wizard). CloudFront will sign requests to S3 (OAC recommended). Set *Viewer Protocol Policy* to **Redirect HTTP to HTTPS**. Set Default Root Object to `index.html`. Save and create. (Guided tutorial in AWS docs). ([AWS Documentation][4])
+
+After creation, note the **Distribution ID** (e.g., `E1ABC...`) and domain (`dxxxxxxxx.cloudfront.net`).
+
+---
+
+### E. Update S3 bucket policy so CloudFront (only your distribution) can read objects
+
+Create `bucket-policy.json` (replace placeholders) — allows only CloudFront distribution to `s3:GetObject`:
+
+```json
+{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Principal": { "Service": "cloudfront.amazonaws.com" },
+      "Action":"s3:GetObject",
+      "Resource":"arn:aws:s3:::YOUR_BUCKET/*",
+      "Condition":{"StringEquals":{"AWS:SourceArn":"arn:aws:cloudfront::YOUR_ACCOUNT_ID:distribution/YOUR_DISTRIBUTION_ID"}}
+    }
+  ]
+}
+```
+
+Then apply:
+
+```bash
+aws s3api put-bucket-policy --bucket $BUCKET --policy file://bucket-policy.json
+```
+
+(If you made the distribution using the CloudFront console and chose *Restrict Bucket Access*, the console can auto-create the required policy; otherwise use the JSON above.) ([AWS Documentation][1])
+
+---
+
+### F. Deploy Lambda function (package & create)
+
+```bash
+cd lambda
+zip function.zip lambda_function.py
+
+# get account id
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# create the function (replace region, role ARN)
+ROLE_ARN=$(aws iam get-role --role-name $ROLE_NAME --query 'Role.Arn' --output text)
+aws lambda create-function \
+  --function-name cf-invalidator \
+  --runtime python3.11 \
+  --role $ROLE_ARN \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://function.zip \
+  --timeout 30 \
+  --environment Variables="{CLOUDFRONT_DISTRIBUTION_ID=REPLACE_AFTER_CF_CREATED}"
+```
+
+> Note: set `CLOUDFRONT_DISTRIBUTION_ID` environment variable to the actual distribution id once you have it (you can update function config later using `aws lambda update-function-configuration --function-name cf-invalidator --environment Variables={CLOUDFRONT_DISTRIBUTION_ID=E1ABC...}`).
+
+---
+
+### G. Grant the Lambda role permission to call CloudFront invalidations
+
+After you have `YOUR_DISTRIBUTION_ID` and `YOUR_ACCOUNT_ID`, create `cf-inv-policy.json` (replace values) and attach as inline policy:
+
+```bash
+aws iam put-role-policy --role-name $ROLE_NAME --policy-name CloudFrontInvalidationPolicy --policy-document file://cf-inv-policy.json
+```
+
+(If you used `"Resource": "*"`, you can skip the fine-grained ARN replacement for testing; for production lock down to the distribution ARN.)
+
+Also ensure `AWSLambdaBasicExecutionRole` is attached (we did earlier) for CloudWatch logs.
+
+(Reference: create\_invalidation in boto3 + API docs). ([Boto3][5])
+
+---
+
+### H. Give S3 permission to invoke the Lambda and configure the bucket notification
+
+1. Add permission so S3 can invoke your function:
+
+```bash
+aws lambda add-permission \
+  --function-name cf-invalidator \
+  --statement-id s3invoke \
+  --action "lambda:InvokeFunction" \
+  --principal s3.amazonaws.com \
+  --source-arn arn:aws:s3:::$BUCKET
+```
+
+2. Edit `notification.json` to contain your function's ARN (or run below inline), then:
+
+```bash
+aws s3api put-bucket-notification-configuration --bucket $BUCKET --notification-configuration file://notification.json
+```
+
+(Documentation: S3 → Lambda event notifications). ([AWS Documentation][6])
+
+---
+
+# 5) Full quick test
+
+1. Check site served by CloudFront: `curl -I https://dxxxxxxxx.cloudfront.net/index.html` — you'll see `X-Cache: Hit from cloudfront` or `Miss from cloudfront`.
+2. Modify and upload `/index.html`:
+
+```bash
+echo "Deployed at $(date)" > site/index.html
+aws s3 cp site/index.html s3://$BUCKET/index.html
+```
+
+3. Lambda will be triggered by the S3 event, call CloudFront `CreateInvalidation`. Check CloudWatch Logs for the function (`/aws/lambda/cf-invalidator`) to confirm invalidation created and see InvalidationId.
+4. Re-check `curl -I` to see a fresh `X-Cache` (first request after invalidation will be Miss).
+
+---
+
+# 6) Troubleshooting & common gotchas
+
+* `403 AccessDenied` from CloudFront → check S3 bucket policy and that CloudFront is using OAC (or OAI) and that `AWS:SourceArn` matches your distribution ARN. ([AWS Documentation][1])
+* Lambda not invoked → confirm `put-bucket-notification-configuration` applied and `lambda add-permission` granted. Check CloudWatch logs for any invocation errors. ([AWS Documentation][6])
+* Invalidation cost & rate limits — first **1,000 invalidation paths/month** are free; beyond that, CloudFront charges per path. To avoid cost, prefer versioned filenames (e.g., `app.v2.js`) instead of invalidating many files. ([AWS Documentation][7])
+
+---
+
+# 7) Security & production tips
+
+* Limit Lambda IAM policy to only the CloudFront distribution ARN (don’t leave `Resource: "*"` in prod).
+* Use OAC (not OAI) for new deployments — recommended pattern to secure S3 origin. ([AWS Documentation][1])
+* Prefer object-versioning naming (fingerprint files) in CI/CD to avoid frequent invalidations (cheaper + faster).
+* If you need complex cache rules (e.g., /api non-cached), configure CloudFront Cache Behaviors.
+
+---
+
+# 8) Useful docs (quick)
+
+* CloudFront + S3 OAC / restrict S3 access. ([AWS Documentation][1])
+* Using an Amazon S3 trigger to invoke Lambda. ([AWS Documentation][8])
+* Boto3 / CloudFront `create_invalidation` API. ([Boto3][5])
+* ACM certs for CloudFront must be requested in **us-east-1** (if you wire a custom domain). ([AWS Documentation][2])
+* CloudFront invalidation pricing / first 1,000 paths free. ([AWS Documentation][7])
+
+---
+
+If you want, I can now:
+
+* produce a single **ready-to-run script** that creates the IAM role, packages the Lambda, creates/updates the notification and shows exactly where to paste the CloudFront distribution ID, **or**
+* produce a **Terraform** or **CloudFormation / SAM** template for the entire stack (S3 + CloudFront + OAC + Lambda + bucket policy + notification).
+
+Which would you like me to generate right now? (I can produce the script or a template instantly.)
+
+[1]: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html?utm_source=chatgpt.com "Restrict access to an Amazon S3 origin - Amazon CloudFront"
+[2]: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cnames-and-https-requirements.html?utm_source=chatgpt.com "Requirements for using SSL/TLS certificates with CloudFront"
+[3]: https://awscli.amazonaws.com/v2/documentation/api/2.9.6/reference/cloudfront/create-origin-access-control.html?utm_source=chatgpt.com "create-origin-access-control - cloudfront"
+[4]: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/GettingStarted.SimpleDistribution.html?utm_source=chatgpt.com "Get started with a CloudFront standard distribution"
+[5]: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/cloudfront/client/create_invalidation.html?utm_source=chatgpt.com "create_invalidation - Boto3 1.40.28 documentation - AWS"
+[6]: https://docs.aws.amazon.com/lambda/latest/dg/with-s3.html?utm_source=chatgpt.com "Process Amazon S3 event notifications with Lambda"
+[7]: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PayingForInvalidation.html?utm_source=chatgpt.com "Pay for file invalidation - Amazon CloudFront"
+[8]: https://docs.aws.amazon.com/lambda/latest/dg/with-s3-example.html?utm_source=chatgpt.com "Using an Amazon S3 trigger to invoke a Lambda function"
