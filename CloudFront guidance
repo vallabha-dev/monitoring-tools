@@ -1,0 +1,159 @@
+# CloudFront — concise step-by-step guide (practical, copy-pasteable)
+
+Nice — below is a practical walkthrough that covers the common scenarios (static site on S3, dynamic/custom origin, private content), plus commands, an example S3 bucket policy for Origin Access Control, invalidation CLI, and operational tips. I’ll assume you want a production-ready setup (HTTPS, private S3, proper caching). I’ll not ask questions — I’ll give the best general setup you can follow and tweak.
+
+---
+
+## Quick prerequisites
+
+* AWS account + IAM user with permissions for CloudFront, S3, ACM, (and ELB/EC2 if using those origins).
+* Your origin content ready (S3 bucket or a web server / ALB).
+* If you will use a custom domain (CNAME) with HTTPS, you’ll need an ACM certificate **in us-east-1 (N. Virginia)** for CloudFront. ([AWS Documentation][1])
+
+---
+
+## 1) Static website on S3 (recommended **OAC** — Origin Access Control)
+
+This is the most common CloudFront use-case. OAC is the modern, recommended way to let CloudFront securely access a private S3 bucket.
+
+### Steps
+
+1. **Create S3 bucket** and upload files. Keep **Block Public Access = ON** (so objects are private).
+2. **Create CloudFront Origin Access Control (OAC)** or configure OAC when creating the distribution. OAC is recommended over the legacy OAI. It lets CloudFront sign requests to S3 using IAM principals and supports SSE-KMS, new regions, etc. ([AWS Documentation][2])
+3. **Update S3 bucket policy** to allow CloudFront to read objects for your distribution (example below). This is the typical pattern: allow the CloudFront service principal but restrict by `AWS:SourceArn` to your distribution. (Example policy provided below.) ([AWS Documentation][2])
+4. **Create a CloudFront distribution** (Console: CloudFront → Create distribution → Web / standard distribution). For the Origin: select your S3 bucket, set Origin Access = the OAC you created, and pick the origin protocol (Match viewer or HTTPS only if needed). In the distribution settings, set Viewer Protocol Policy to **Redirect HTTP to HTTPS**. Set Compression = enabled if you serve text assets. ([AWS Documentation][3])
+5. (Optional) **Custom domain + HTTPS**: add Alternate Domain Names (CNAMEs) and attach an ACM certificate **from us-east-1** (request in ACM → us-east-1). ([AWS Documentation][1])
+6. Monitor distribution status in the CloudFront console — when the distribution state reports **Deployed** it’s active. (No need to change object names when distribution is active; use versioned object names to avoid invalidations when possible.)
+
+### Example S3 bucket policy for OAC (fill in your IDs)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontServicePrincipalReadOnly",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudfront.amazonaws.com" },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/*",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "arn:aws:cloudfront::YOUR-AWS-ACCOUNT-ID:distribution/DISTRIBUTION-ID"
+        }
+      }
+    }
+  ]
+}
+```
+
+(Adapt if you need read/write or if encrypting with SSE-KMS — you’ll also need KMS permissions.) ([AWS Documentation][2])
+
+---
+
+## 2) Custom origin (ALB / EC2 / external HTTP)
+
+If your origin is an Application Load Balancer, EC2 or an external server:
+
+1. In CloudFront **Create distribution** → Origin domain = your ALB DNS name or custom origin hostname.
+2. **Origin Protocol Policy**: if your origin supports HTTPS, choose **HTTPS only** or **Match viewer**. For ALB/ELB, you can present an ACM cert on the load balancer (region-specific).
+3. **Caching behavior**: set path patterns if some paths should be cached differently (e.g., `/api/*` bypass cache, `/static/*` long TTL).
+4. **Headers/Cookies/Query strings to forward**: forward only what you need (less forwarding → better cache hit rate). Use origin request policies and cache policies to separate which viewer headers are cached vs which are forwarded.
+5. For session/authorization flows, prefer **signed cookies** or signed URLs (see Private content below) rather than forwarding Authorization headers to maximize caching.
+
+---
+
+## 3) Serving private content (signed URLs / signed cookies)
+
+If content must be restricted to authenticated users:
+
+* **Decide**: signed URLs for single file access; signed cookies when you need to grant access to multiple files (e.g., subscribers area). Use CloudFront’s key groups & public keys to validate signatures. ([AWS Documentation][4])
+* **Basic flow**:
+
+  1. Create a CloudFront **Key Pair / Key Group** (upload your public key) or use a trusted signer.
+  2. In the distribution, restrict access by configuring a cache behavior that requires signed URLs/cookies (trusted key groups).
+  3. Generate signed URL or cookie in your app using the private key and expiration policy (SDKs have helpers).
+* For private S3 + CloudFront, still use OAC to keep the bucket non-public and use CloudFront signed URLs/cookies for viewer access. ([AWS Documentation][4])
+
+---
+
+## 4) Invalidation (how to purge cached objects)
+
+Use invalidations or version your object names. **Versioning** (e.g., `app.v2.js`) is cheaper and recommended for static assets.
+
+If you need to invalidate, example AWS CLI:
+
+```bash
+aws cloudfront create-invalidation \
+  --distribution-id EDFDVBD6EXAMPLE \
+  --paths "/index.html" "/css/*"
+```
+
+You must supply a unique CallerReference per invalidation (a timestamp is common). ([AWS Documentation][5])
+
+---
+
+## 5) Useful CLI / curl checks
+
+* Check headers returned by CloudFront to inspect cache status:
+
+```bash
+curl -I https://your-distribution-domain.cloudfront.net/path/file.ext
+# Look at X-Cache (Hit from cloudfront / Miss from cloudfront) and Age
+```
+
+* To request an invalidation with a unique CallerReference (timestamp in shell):
+
+```bash
+aws cloudfront create-invalidation --distribution-id $DIST --paths "/*" \
+  --caller-reference "$(date +%s)"
+```
+
+---
+
+## 6) Performance & security best practices (short)
+
+* **OAC** for S3 → keep buckets private. ([AWS Documentation][2])
+* **Use caching headers** (Cache-Control / Expires) on origin content so CloudFront caches intelligently.
+* **Avoid forwarding unnecessary headers/cookies/querystrings** — reduces cache fragmentation.
+* **Enable compression** (CloudFront automatic compression for text assets).
+* **Use versioned filenames** for static assets to avoid frequent invalidations.
+* **Enable AWS WAF** in front of CloudFront for OWASP protections and request filtering.
+* **Enable real-time logs or standard logs** for analytics and debugging (send to Kinesis/S3).
+* **Consider Origin Shield** for extra origin protection when many edge locations hit the origin.
+
+---
+
+## 7) Troubleshooting quick checklist
+
+* **403 / AccessDenied**: bucket policy not allowing CloudFront Service principal with `SourceArn` — check OAC + bucket policy. ([AWS Documentation][2])
+* **X-Cache returns Miss** for many requests: either first request (cold), or forwarding headers/cookies you don’t need — reduce forwarded elements.
+* **CORS errors**: configure S3 CORS properly (if serving fonts/XHR).
+* **SSL issue for custom domain**: confirm ACM cert is in **us-east-1** and domain validation passed. ([AWS Documentation][1])
+
+---
+
+## 8) Advanced (quick notes)
+
+* **CloudFront Functions** for lightweight edge JS (header rewrites, security headers) — runs at viewer request/response with low latency (use for simple logic). For heavy custom logic, use **Lambda\@Edge**.
+* **Signed URLs + streaming / premium media**: CloudFront supports streaming and signed URLs for media.
+* **Automate**: use CloudFormation/CDK/Terraform to create distribution + origins + OAC + bucket policy reproducibly.
+
+---
+
+## Handy links (official docs I referenced)
+
+* CloudFront getting started / create distribution. ([AWS Documentation][3])
+* Restrict access to an S3 origin (OAC recommendation & how-to). ([AWS Documentation][2])
+* S3 bucket policy examples for CloudFront/OAC. ([AWS Documentation][2])
+* Create invalidation examples (AWS CLI). ([AWS Documentation][5])
+* ACM certs for CloudFront must be requested/imported in **us-east-1**. ([AWS Documentation][1])
+
+---
+
+
+[1]: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cnames-and-https-requirements.html?utm_source=chatgpt.com "Requirements for using SSL/TLS certificates with CloudFront"
+[2]: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html?utm_source=chatgpt.com "Restrict access to an Amazon S3 origin - Amazon CloudFront"
+[3]: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/GettingStarted.SimpleDistribution.html?utm_source=chatgpt.com "Get started with a CloudFront standard distribution"
+[4]: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PrivateContent.html?utm_source=chatgpt.com "Serve private content with signed URLs and signed cookies"
+[5]: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/example_cloudfront_CreateInvalidation_section.html?utm_source=chatgpt.com "Use CreateInvalidation with a CLI - Amazon CloudFront"
