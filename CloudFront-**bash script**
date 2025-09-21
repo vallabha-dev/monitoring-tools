@@ -1,0 +1,229 @@
+Perfect 👍 I’ll give you a **bash script** that you can run from your terminal.
+This script will:
+
+1. Create IAM role + policies for the Lambda.
+2. Package and deploy the Lambda function.
+3. Add permissions so S3 can trigger it.
+4. Configure S3 → Lambda notification.
+
+⚠️ **You must already have:**
+
+* An S3 bucket created for your static site (private).
+* A CloudFront distribution pointing to that bucket with OAC/OAI configured.
+* Your distribution ID handy.
+
+---
+
+# 📜 Ready-to-run script
+
+Save as `deploy.sh`:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------
+# CONFIGURATION - EDIT ME
+# ------------------------
+REGION="ap-south-1"
+BUCKET="YOUR_BUCKET_NAME"
+FUNCTION_NAME="cf-invalidator"
+ROLE_NAME="LambdaCFInvalidatorRole"
+DISTRIBUTION_ID="YOUR_CLOUDFRONT_DISTRIBUTION_ID"  # <<< EDIT THIS
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# ------------------------
+# Create IAM role
+# ------------------------
+echo "[1/6] Creating IAM role..."
+cat > trust-policy.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "lambda.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+
+aws iam create-role \
+  --role-name $ROLE_NAME \
+  --assume-role-policy-document file://trust-policy.json || echo "Role may already exist"
+
+aws iam attach-role-policy \
+  --role-name $ROLE_NAME \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# CloudFront invalidation policy
+cat > cf-inv-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontInvalidation",
+      "Effect": "Allow",
+      "Action": "cloudfront:CreateInvalidation",
+      "Resource": "arn:aws:cloudfront::$ACCOUNT_ID:distribution/$DISTRIBUTION_ID"
+    }
+  ]
+}
+EOF
+
+aws iam put-role-policy \
+  --role-name $ROLE_NAME \
+  --policy-name CloudFrontInvalidationPolicy \
+  --policy-document file://cf-inv-policy.json
+
+ROLE_ARN=$(aws iam get-role --role-name $ROLE_NAME --query 'Role.Arn' --output text)
+
+# ------------------------
+# Create Lambda function
+# ------------------------
+echo "[2/6] Creating Lambda function..."
+
+mkdir -p lambda
+cat > lambda/lambda_function.py <<'EOF'
+import os
+import boto3
+import logging
+from urllib.parse import unquote_plus
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+cloudfront = boto3.client('cloudfront')
+
+def lambda_handler(event, context):
+    distro_id = os.environ.get('CLOUDFRONT_DISTRIBUTION_ID')
+    if not distro_id:
+        logger.error("CLOUDFRONT_DISTRIBUTION_ID not set")
+        return {"error": "missing env CLOUDFRONT_DISTRIBUTION_ID"}
+
+    paths = set()
+    for record in event.get('Records', []):
+        s3 = record.get('s3', {})
+        obj = s3.get('object', {})
+        key = unquote_plus(obj.get('key', ''))
+        if not key:
+            continue
+        paths.add('/' + key)
+        if key.endswith('index.html'):
+            paths.add('/')
+            if '/' in key:
+                folder = '/' + key.rsplit('/', 1)[0] + '/'
+                paths.add(folder)
+
+    if not paths:
+        logger.info("No paths found in event")
+        return {"status": "no_paths"}
+
+    caller_ref = context.aws_request_id
+    items = list(paths)
+    logger.info("Creating invalidation for %s", items)
+
+    resp = cloudfront.create_invalidation(
+        DistributionId=distro_id,
+        InvalidationBatch={
+            'Paths': {'Quantity': len(items), 'Items': items},
+            'CallerReference': caller_ref
+        }
+    )
+
+    inv_id = resp.get('Invalidation', {}).get('Id')
+    logger.info("Invalidation created: %s", inv_id)
+    return {"invalidation_id": inv_id, "paths": items}
+EOF
+
+cd lambda
+zip function.zip lambda_function.py
+cd ..
+
+aws lambda create-function \
+  --function-name $FUNCTION_NAME \
+  --runtime python3.11 \
+  --role $ROLE_ARN \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://lambda/function.zip \
+  --timeout 30 \
+  --environment Variables="{CLOUDFRONT_DISTRIBUTION_ID=$DISTRIBUTION_ID}" \
+  --region $REGION || \
+aws lambda update-function-code \
+  --function-name $FUNCTION_NAME \
+  --zip-file fileb://lambda/function.zip \
+  --region $REGION
+
+# ------------------------
+# Allow S3 to trigger Lambda
+# ------------------------
+echo "[3/6] Adding S3 invoke permission..."
+aws lambda add-permission \
+  --function-name $FUNCTION_NAME \
+  --statement-id s3invoke \
+  --action "lambda:InvokeFunction" \
+  --principal s3.amazonaws.com \
+  --source-arn arn:aws:s3:::$BUCKET \
+  --region $REGION || echo "Permission may already exist"
+
+# ------------------------
+# Configure bucket notification
+# ------------------------
+echo "[4/6] Configuring bucket notification..."
+FUNC_ARN=$(aws lambda get-function --function-name $FUNCTION_NAME --query 'Configuration.FunctionArn' --output text)
+
+cat > notification.json <<EOF
+{
+  "LambdaFunctionConfigurations": [
+    {
+      "LambdaFunctionArn": "$FUNC_ARN",
+      "Events": ["s3:ObjectCreated:*"]
+    }
+  ]
+}
+EOF
+
+aws s3api put-bucket-notification-configuration \
+  --bucket $BUCKET \
+  --notification-configuration file://notification.json \
+  --region $REGION
+
+# ------------------------
+# Done
+# ------------------------
+echo "✅ Deployment finished."
+echo "Lambda function: $FUNCTION_NAME"
+echo "CloudFront distribution: $DISTRIBUTION_ID"
+echo "S3 bucket: $BUCKET"
+```
+
+---
+
+# 🚀 How to run
+
+```bash
+chmod +x deploy.sh
+./deploy.sh
+```
+
+* Edit **`BUCKET`** and **`DISTRIBUTION_ID`** in the config section before running.
+* The script is idempotent: if the role or function already exists, it will update.
+
+---
+
+# ✅ Test
+
+1. Upload a new file to S3:
+
+```bash
+echo "Updated at $(date)" > index.html
+aws s3 cp index.html s3://YOUR_BUCKET/index.html
+```
+
+2. Check CloudWatch Logs → function logs. You should see `Invalidation created: ...`.
+3. Access CloudFront URL → you’ll see fresh content after invalidation.
+
+---
+
+Do you also want me to extend this script so it **creates the CloudFront distribution and OAC automatically**, or do you prefer keeping that as a manual console step (safer for first-time setup)?
