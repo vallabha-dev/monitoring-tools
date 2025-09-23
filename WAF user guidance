@@ -1,0 +1,109 @@
+
+# 📘 AWS WAF Notes
+
+## 🔹 Introduction
+
+* **AWS WAF (Web Application Firewall)** protects web applications from **common web exploits** (SQL injection, XSS, etc.).
+* Works with:
+
+  * **Amazon CloudFront** (global edge protection)
+  * **Application Load Balancer (ALB)**
+  * **Amazon API Gateway**
+  * **AWS AppSync**
+
+---
+
+## 🔹 Core Concepts
+
+1. **Web ACL (Access Control List)**
+
+   * Main container for WAF rules.
+   * Attached to resources (CloudFront, ALB, API Gateway, AppSync).
+   * Defines **default action**: Allow or Block.
+
+2. **Rules**
+
+   * Define conditions to allow, block, or count requests.
+   * Rules can have multiple statements.
+
+3. **Rule Groups**
+
+   * Collection of rules managed as a unit.
+   * Can be **Managed (AWS / Marketplace)** or **Custom**.
+
+4. **Conditions / Statements**
+
+   * Criteria inside a rule.
+   * Examples:
+
+     * IP match
+     * String match
+     * SQL injection match
+     * Cross-site scripting match
+     * Geo match
+     * Rate-based
+
+5. **Actions**
+
+   * What happens when a request matches:
+
+     * **Allow**
+     * **Block**
+     * **Count** (log only)
+     * **CAPTCHA / Challenge** (extra verification)
+
+---
+
+## 🔹 Managed Rule Groups
+
+* Preconfigured rules by **AWS** or **AWS Marketplace sellers**.
+* Examples:
+
+  * AWSManagedRulesCommonRuleSet → Protects against common OWASP Top 10 vulnerabilities.
+  * Anonymous IP list, bot control, SQLi/XSS protection.
+
+---
+
+## 🔹 Rate-Based Rules
+
+* Limit requests from a single IP.
+* Example: Block if > 2000 requests in 5 minutes.
+* Useful for **DDoS mitigation** and **brute force protection**.
+
+---
+
+## 🔹 Logging & Monitoring
+
+* **WAF Logging** → Send logs to Amazon Kinesis Data Firehose, S3, or CloudWatch.
+* Can integrate with **AWS Security Hub**.
+* Metrics available in **CloudWatch**.
+
+---
+
+## 🔹 Pricing
+
+* Charged for:
+
+  * Number of Web ACLs
+  * Number of rules
+  * Number of requests processed
+
+---
+
+## 🔹 Best Practices
+
+* Always start with **Count mode** before applying **Block**.
+* Use **AWS Managed Rules** for quick protection.
+* Apply **Rate-based rules** to APIs and login endpoints.
+* Enable **logging & monitoring** to tune rules.
+* Keep **default action = Allow** and block only malicious requests via rules.
+
+---
+
+## 🔹 Comparison with AWS Shield
+
+* **AWS WAF** → Protects against **application layer (L7)** attacks (SQLi, XSS, bots).
+* **AWS Shield** → Protects against **DDoS (L3/L4)** attacks.
+* **Shield Advanced + WAF** = Strongest protection.
+
+---
